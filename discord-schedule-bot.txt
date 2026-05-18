@@ -1,0 +1,573 @@
+import discord
+from discord.ext import commands, tasks
+from discord import ui
+import json
+import os
+from datetime import datetime, timedelta
+
+# ===== 設定 =====
+TOKEN = os.environ.get("DISCORD_TOKEN")
+ANNOUNCE_CHANNEL_ID = int(os.environ.get("ANNOUNCE_CHANNEL_ID", 0))
+SCHEDULE_FILE = "schedule.json"
+REMINDER_FILE = "reminder_settings.json"
+
+# ===== データ管理 =====
+def load_schedule():
+    if not os.path.exists(SCHEDULE_FILE):
+        return []
+    with open(SCHEDULE_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_schedule(data):
+    with open(SCHEDULE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def get_next_id(schedule):
+    if not schedule:
+        return 1
+    return max(e["id"] for e in schedule) + 1
+
+def load_reminder_settings():
+    if not os.path.exists(REMINDER_FILE):
+        return {}
+    with open(REMINDER_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_reminder_settings(data):
+    with open(REMINDER_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def get_user_setting(user_name):
+    settings = load_reminder_settings()
+    return settings.get(user_name, {"enabled": False, "timing": "1day"})
+
+# ===== BOT設定 =====
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+current_year = datetime.now().year
+current_month = datetime.now().month
+panel_message = None
+
+# ===== モーダル：予定追加 =====
+class ScheduleModal(ui.Modal, title="📅 予定を追加"):
+    event_title = ui.TextInput(label="予定のタイトル", placeholder="例: 定例ミーティング", max_length=50)
+    event_date = ui.TextInput(label="日付（例: 2026/05/25）", placeholder="YYYY/MM/DD", max_length=10)
+    event_time = ui.TextInput(label="時間（例: 19:00）　※任意", placeholder="HH:MM または 空欄", required=False, max_length=5)
+    event_note = ui.TextInput(label="メモ　※任意", placeholder="場所や詳細など", required=False, style=discord.TextStyle.paragraph, max_length=200)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            datetime.strptime(self.event_date.value, "%Y/%m/%d")
+        except ValueError:
+            await interaction.response.send_message("❌ 日付の形式が正しくありません。`YYYY/MM/DD` で入力してください。", ephemeral=True)
+            return
+
+        schedule = load_schedule()
+        new_event = {
+            "id": get_next_id(schedule),
+            "title": self.event_title.value,
+            "date": self.event_date.value,
+            "time": self.event_time.value or "",
+            "note": self.event_note.value or "",
+            "created_by": str(interaction.user.display_name),
+            "participants": [str(interaction.user.display_name)]
+        }
+        schedule.append(new_event)
+        schedule.sort(key=lambda x: x["date"])
+        save_schedule(schedule)
+
+        await interaction.response.send_message(f"✅ **{self.event_title.value}** を追加しました！", ephemeral=True)
+
+        if ANNOUNCE_CHANNEL_ID:
+            channel = bot.get_channel(ANNOUNCE_CHANNEL_ID)
+            if channel:
+                time_str = f" {new_event['time']}" if new_event['time'] else ""
+                note_str = f"\n📝 {new_event['note']}" if new_event['note'] else ""
+                await channel.send(
+                    f"📣 **新しい予定が追加されました！**\n"
+                    f"```\n{new_event['date']}{time_str}　{new_event['title']}{note_str}\n```"
+                    f"追加者: {new_event['created_by']}\n"
+                    f"👉 スケジュールパネルから参加登録できます！"
+                )
+
+        await refresh_panel(interaction)
+
+# ===== モーダル：予定編集 =====
+class EditModal(ui.Modal, title="✏️ 予定を編集"):
+    def __init__(self, event):
+        super().__init__()
+        self.event_id = event["id"]
+        self.event_title = ui.TextInput(label="予定のタイトル", default=event["title"], max_length=50)
+        self.event_date = ui.TextInput(label="日付（YYYY/MM/DD）", default=event["date"], max_length=10)
+        self.event_time = ui.TextInput(label="時間（HH:MM）　※任意", default=event["time"], required=False, max_length=5)
+        self.event_note = ui.TextInput(label="メモ　※任意", default=event["note"], required=False, style=discord.TextStyle.paragraph, max_length=200)
+        self.add_item(self.event_title)
+        self.add_item(self.event_date)
+        self.add_item(self.event_time)
+        self.add_item(self.event_note)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            datetime.strptime(self.event_date.value, "%Y/%m/%d")
+        except ValueError:
+            await interaction.response.send_message("❌ 日付の形式が正しくありません。", ephemeral=True)
+            return
+
+        schedule = load_schedule()
+        for event in schedule:
+            if event["id"] == self.event_id:
+                event["title"] = self.event_title.value
+                event["date"] = self.event_date.value
+                event["time"] = self.event_time.value or ""
+                event["note"] = self.event_note.value or ""
+                break
+
+        schedule.sort(key=lambda x: x["date"])
+        save_schedule(schedule)
+        await interaction.response.send_message(f"✅ **{self.event_title.value}** を更新しました！", ephemeral=True)
+        await refresh_panel(interaction)
+
+# ===== モーダル：日程調整 =====
+class PollModal(ui.Modal, title="🗳️ 日程調整を作成"):
+    poll_title = ui.TextInput(label="イベント名", placeholder="例: 6月の飲み会", max_length=50)
+    dates = ui.TextInput(
+        label="候補日（1行に1つ、最大5つ）",
+        placeholder="2026/06/01\n2026/06/07\n2026/06/14",
+        style=discord.TextStyle.paragraph,
+        max_length=200
+    )
+    poll_note = ui.TextInput(label="メモ　※任意", required=False, style=discord.TextStyle.paragraph, max_length=200)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        lines = [l.strip() for l in self.dates.value.splitlines() if l.strip()]
+        valid_dates = []
+        for line in lines[:5]:
+            try:
+                datetime.strptime(line, "%Y/%m/%d")
+                valid_dates.append(line)
+            except ValueError:
+                pass
+
+        if not valid_dates:
+            await interaction.response.send_message("❌ 有効な日付がありません。`YYYY/MM/DD` 形式で入力してください。", ephemeral=True)
+            return
+
+        poll_data = {
+            "title": self.poll_title.value,
+            "note": self.poll_note.value or "",
+            "created_by": str(interaction.user.display_name),
+            "dates": {d: [] for d in valid_dates}
+        }
+
+        embed = build_poll_embed(poll_data)
+        view = PollView(poll_data)
+        await interaction.response.send_message(embed=embed, view=view)
+
+# ===== 日程調整Embed =====
+def build_poll_embed(poll_data):
+    embed = discord.Embed(title=f"🗳️ 日程調整：{poll_data['title']}", color=discord.Color.gold())
+    if poll_data["note"]:
+        embed.description = f"📝 {poll_data['note']}"
+    lines = []
+    for date, voters in poll_data["dates"].items():
+        count = len(voters)
+        bar = "🟩" * count + "⬜" * max(0, 5 - count)
+        names = "、".join(voters) if voters else "まだ誰もいません"
+        lines.append(f"**{date}**　{bar} {count}人\n　{names}")
+    embed.add_field(name="📅 候補日", value="\n\n".join(lines), inline=False)
+    embed.set_footer(text=f"作成者: {poll_data['created_by']}")
+    return embed
+
+# ===== 日程調整View =====
+class PollSelect(ui.Select):
+    def __init__(self, poll_data):
+        self.poll_data = poll_data
+        options = [discord.SelectOption(label=date, value=date) for date in poll_data["dates"].keys()]
+        super().__init__(placeholder="参加できる日をすべて選んでください", options=options, min_values=1, max_values=len(options))
+
+    async def callback(self, interaction: discord.Interaction):
+        user = str(interaction.user.display_name)
+        for date in self.poll_data["dates"]:
+            if user in self.poll_data["dates"][date]:
+                self.poll_data["dates"][date].remove(user)
+        for date in self.values:
+            self.poll_data["dates"][date].append(user)
+        embed = build_poll_embed(self.poll_data)
+        await interaction.response.edit_message(embed=embed, view=PollView(self.poll_data))
+
+class PollView(ui.View):
+    def __init__(self, poll_data):
+        super().__init__(timeout=None)
+        self.poll_data = poll_data
+        self.add_item(PollSelect(poll_data))
+
+    @ui.button(label="📅 この日程で予定を作成", style=discord.ButtonStyle.success)
+    async def create_from_poll(self, interaction: discord.Interaction, button: ui.Button):
+        best_date = max(self.poll_data["dates"], key=lambda d: len(self.poll_data["dates"][d]))
+        best_participants = self.poll_data["dates"][best_date]
+        schedule = load_schedule()
+        new_event = {
+            "id": get_next_id(schedule),
+            "title": self.poll_data["title"],
+            "date": best_date,
+            "time": "",
+            "note": self.poll_data.get("note", ""),
+            "created_by": str(interaction.user.display_name),
+            "participants": best_participants
+        }
+        schedule.append(new_event)
+        schedule.sort(key=lambda x: x["date"])
+        save_schedule(schedule)
+        await interaction.response.send_message(
+            f"✅ **{best_date}** で **{self.poll_data['title']}** を予定に追加しました！\n"
+            f"参加者: {', '.join(best_participants)}",
+            ephemeral=True
+        )
+        await refresh_panel(interaction)
+
+# ===== 編集セレクト =====
+class EditSelect(ui.Select):
+    def __init__(self, schedule):
+        options = [
+            discord.SelectOption(label=f"{e['date']}　{e['title']}"[:100], value=str(e["id"]))
+            for e in schedule[:25]
+        ]
+        super().__init__(placeholder="編集する予定を選んでください", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        event_id = int(self.values[0])
+        schedule = load_schedule()
+        event = next((e for e in schedule if e["id"] == event_id), None)
+        if event:
+            await interaction.response.send_modal(EditModal(event))
+
+class EditView(ui.View):
+    def __init__(self, schedule):
+        super().__init__(timeout=60)
+        self.add_item(EditSelect(schedule))
+
+# ===== 削除セレクト =====
+class DeleteSelect(ui.Select):
+    def __init__(self, schedule):
+        options = [
+            discord.SelectOption(label=f"{e['date']}　{e['title']}"[:100], value=str(e["id"]))
+            for e in schedule[:25]
+        ]
+        super().__init__(placeholder="削除する予定を選んでください", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        event_id = int(self.values[0])
+        schedule = load_schedule()
+        event = next((e for e in schedule if e["id"] == event_id), None)
+        schedule = [e for e in schedule if e["id"] != event_id]
+        save_schedule(schedule)
+        title = event["title"] if event else "不明"
+        await interaction.response.send_message(f"🗑 **{title}** を削除しました。", ephemeral=True)
+        await refresh_panel(interaction)
+
+class DeleteView(ui.View):
+    def __init__(self, schedule):
+        super().__init__(timeout=60)
+        self.add_item(DeleteSelect(schedule))
+
+# ===== リマインダー設定 =====
+def build_reminder_status_text(user_name):
+    setting = get_user_setting(user_name)
+    status = "🔔 ON" if setting["enabled"] else "🔕 OFF"
+    timing_labels = {
+        "1day": "前日の朝9時",
+        "same_day": "当日の朝9時",
+        "2hour": "2時間前",
+        "both": "前日＋当日の朝9時"
+    }
+    timing = timing_labels.get(setting["timing"], "前日の朝9時")
+    return (
+        f"### 🔔 あなたのリマインダー設定\n"
+        f"状態：**{status}**\n"
+        f"タイミング：**{timing}**\n\n"
+        f"※ 自分が参加登録しているイベントのみ通知されます"
+    )
+
+class ReminderTimingSelect(ui.Select):
+    def __init__(self, user_name):
+        setting = get_user_setting(user_name)
+        current_timing = setting["timing"]
+        options = [
+            discord.SelectOption(label="前日の朝9時に通知", value="1day", default=(current_timing == "1day")),
+            discord.SelectOption(label="当日の朝9時に通知", value="same_day", default=(current_timing == "same_day")),
+            discord.SelectOption(label="2時間前に通知", value="2hour", default=(current_timing == "2hour")),
+            discord.SelectOption(label="前日＋当日の両方通知", value="both", default=(current_timing == "both")),
+        ]
+        super().__init__(placeholder="通知タイミングを選択", options=options, row=1)
+        self.user_name = user_name
+
+    async def callback(self, interaction: discord.Interaction):
+        user_name = str(interaction.user.display_name)
+        settings = load_reminder_settings()
+        if user_name not in settings:
+            settings[user_name] = {"enabled": False, "timing": "1day"}
+        settings[user_name]["timing"] = self.values[0]
+        save_reminder_settings(settings)
+        await interaction.response.edit_message(
+            content=build_reminder_status_text(user_name),
+            view=ReminderSettingView(user_name)
+        )
+
+class ReminderSettingView(ui.View):
+    def __init__(self, user_name):
+        super().__init__(timeout=60)
+        self.user_name = user_name
+        setting = get_user_setting(user_name)
+        self.on_button.style = discord.ButtonStyle.success if setting["enabled"] else discord.ButtonStyle.secondary
+        self.off_button.style = discord.ButtonStyle.danger if not setting["enabled"] else discord.ButtonStyle.secondary
+        self.add_item(ReminderTimingSelect(user_name))
+
+    @ui.button(label="🔔 ON", row=0)
+    async def on_button(self, interaction: discord.Interaction, button: ui.Button):
+        user_name = str(interaction.user.display_name)
+        settings = load_reminder_settings()
+        if user_name not in settings:
+            settings[user_name] = {"enabled": False, "timing": "1day"}
+        settings[user_name]["enabled"] = True
+        save_reminder_settings(settings)
+        await interaction.response.edit_message(
+            content=build_reminder_status_text(user_name),
+            view=ReminderSettingView(user_name)
+        )
+
+    @ui.button(label="🔕 OFF", row=0)
+    async def off_button(self, interaction: discord.Interaction, button: ui.Button):
+        user_name = str(interaction.user.display_name)
+        settings = load_reminder_settings()
+        if user_name not in settings:
+            settings[user_name] = {"enabled": False, "timing": "1day"}
+        settings[user_name]["enabled"] = False
+        save_reminder_settings(settings)
+        await interaction.response.edit_message(
+            content=build_reminder_status_text(user_name),
+            view=ReminderSettingView(user_name)
+        )
+
+# ===== メインEmbed =====
+def build_embed(schedule, year, month):
+    month_str = f"{year}年{month}月"
+    embed = discord.Embed(title=f"📅 スケジュール管理　{month_str}", color=discord.Color.blue())
+    filtered = [e for e in schedule if e["date"].startswith(f"{year}/{month:02d}")]
+    if not filtered:
+        embed.description = "この月の予定はありません。「📅 予定を追加」から追加してください！"
+    else:
+        lines = []
+        for event in filtered:
+            time_str = f" {event['time']}" if event["time"] else ""
+            count = len(event["participants"])
+            names = "、".join(event["participants"]) if event["participants"] else "なし"
+            note_str = f"\n　　📝 {event['note']}" if event["note"] else ""
+            lines.append(
+                f"**{event['date']}{time_str}　{event['title']}**\n"
+                f"　　👥 {count}人参加：{names}{note_str}"
+            )
+        embed.description = "\n\n".join(lines)
+    embed.set_footer(text=f"最終更新: {datetime.now().strftime('%Y/%m/%d %H:%M')}")
+    return embed
+
+# ===== 参加セレクト =====
+class ParticipateSelect(ui.Select):
+    def __init__(self, schedule):
+        options = [
+            discord.SelectOption(label=f"{e['date']}　{e['title']}"[:100], value=str(e["id"]))
+            for e in schedule[:25]
+        ]
+        super().__init__(placeholder="参加/キャンセルする予定を選んでください", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        event_id = int(self.values[0])
+        user = str(interaction.user.display_name)
+        schedule = load_schedule()
+        msg = ""
+        for event in schedule:
+            if event["id"] == event_id:
+                if user in event["participants"]:
+                    event["participants"].remove(user)
+                    msg = f"👋 **{event['title']}** の参加をキャンセルしました。"
+                else:
+                    event["participants"].append(user)
+                    msg = f"✅ **{event['title']}** に参加登録しました！"
+                break
+        save_schedule(schedule)
+        await interaction.response.send_message(msg, ephemeral=True)
+        await refresh_panel(interaction)
+
+class ParticipateView(ui.View):
+    def __init__(self, schedule):
+        super().__init__(timeout=60)
+        self.add_item(ParticipateSelect(schedule))
+
+# ===== メインView =====
+class ScheduleView(ui.View):
+    def __init__(self, year, month):
+        super().__init__(timeout=None)
+        self.year = year
+        self.month = month
+
+    @ui.button(label="◀ 先月", style=discord.ButtonStyle.secondary, row=0)
+    async def prev_month(self, interaction: discord.Interaction, button: ui.Button):
+        global current_year, current_month
+        if current_month == 1:
+            current_month = 12
+            current_year -= 1
+        else:
+            current_month -= 1
+        await interaction.response.defer()
+        await refresh_panel(interaction)
+
+    @ui.button(label="今月", style=discord.ButtonStyle.secondary, row=0)
+    async def this_month(self, interaction: discord.Interaction, button: ui.Button):
+        global current_year, current_month
+        current_year = datetime.now().year
+        current_month = datetime.now().month
+        await interaction.response.defer()
+        await refresh_panel(interaction)
+
+    @ui.button(label="来月 ▶", style=discord.ButtonStyle.secondary, row=0)
+    async def next_month(self, interaction: discord.Interaction, button: ui.Button):
+        global current_year, current_month
+        if current_month == 12:
+            current_month = 1
+            current_year += 1
+        else:
+            current_month += 1
+        await interaction.response.defer()
+        await refresh_panel(interaction)
+
+    @ui.button(label="📅 予定を追加", style=discord.ButtonStyle.primary, row=1)
+    async def add_event(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(ScheduleModal())
+
+    @ui.button(label="✅ 参加/キャンセル", style=discord.ButtonStyle.success, row=1)
+    async def participate(self, interaction: discord.Interaction, button: ui.Button):
+        schedule = load_schedule()
+        if not schedule:
+            await interaction.response.send_message("予定がまだありません！", ephemeral=True)
+            return
+        await interaction.response.send_message("予定を選んでください：", view=ParticipateView(schedule), ephemeral=True)
+
+    @ui.button(label="✏️ 予定を編集", style=discord.ButtonStyle.secondary, row=1)
+    async def edit_event(self, interaction: discord.Interaction, button: ui.Button):
+        schedule = load_schedule()
+        if not schedule:
+            await interaction.response.send_message("編集できる予定がありません。", ephemeral=True)
+            return
+        await interaction.response.send_message("編集する予定を選んでください：", view=EditView(schedule), ephemeral=True)
+
+    @ui.button(label="🗑 削除", style=discord.ButtonStyle.danger, row=1)
+    async def delete_event(self, interaction: discord.Interaction, button: ui.Button):
+        schedule = load_schedule()
+        if not schedule:
+            await interaction.response.send_message("削除できる予定がありません。", ephemeral=True)
+            return
+        await interaction.response.send_message("削除する予定を選んでください：", view=DeleteView(schedule), ephemeral=True)
+
+    @ui.button(label="🗳️ 日程調整", style=discord.ButtonStyle.success, row=2)
+    async def create_poll(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(PollModal())
+
+    @ui.button(label="🔔 リマインダー設定", style=discord.ButtonStyle.secondary, row=2)
+    async def reminder_setting(self, interaction: discord.Interaction, button: ui.Button):
+        user_name = str(interaction.user.display_name)
+        await interaction.response.send_message(
+            content=build_reminder_status_text(user_name),
+            view=ReminderSettingView(user_name),
+            ephemeral=True
+        )
+
+# ===== パネル更新 =====
+async def refresh_panel(interaction: discord.Interaction):
+    global panel_message
+    if panel_message:
+        schedule = load_schedule()
+        embed = build_embed(schedule, current_year, current_month)
+        try:
+            await panel_message.edit(embed=embed, view=ScheduleView(current_year, current_month))
+        except Exception as e:
+            print(f"パネル更新エラー: {e}")
+
+# ===== リマインダータスク =====
+@tasks.loop(hours=1)
+async def reminder_task():
+    if not ANNOUNCE_CHANNEL_ID:
+        return
+    now = datetime.now()
+    current_hour = now.hour
+    schedule = load_schedule()
+    settings = load_reminder_settings()
+
+    for user_name, setting in settings.items():
+        if not setting["enabled"]:
+            continue
+
+        timing = setting["timing"]
+        target_events = []
+
+        if timing == "1day" and current_hour == 9:
+            target_date = (now + timedelta(days=1)).strftime("%Y/%m/%d")
+            target_events = [e for e in schedule if e["date"] == target_date and user_name in e["participants"]]
+
+        elif timing == "same_day" and current_hour == 9:
+            target_date = now.strftime("%Y/%m/%d")
+            target_events = [e for e in schedule if e["date"] == target_date and user_name in e["participants"]]
+
+        elif timing == "2hour":
+            target_date = now.strftime("%Y/%m/%d")
+            target_events = [
+                e for e in schedule
+                if e["date"] == target_date and e["time"] and
+                int(e["time"].split(":")[0]) == current_hour + 2 and
+                user_name in e["participants"]
+            ]
+
+        elif timing == "both" and current_hour == 9:
+            dates = [now.strftime("%Y/%m/%d"), (now + timedelta(days=1)).strftime("%Y/%m/%d")]
+            target_events = [e for e in schedule if e["date"] in dates and user_name in e["participants"]]
+
+        if not target_events:
+            continue
+
+        guild = bot.guilds[0] if bot.guilds else None
+        if not guild:
+            continue
+
+        member = discord.utils.find(lambda m: m.display_name == user_name, guild.members)
+        if not member:
+            continue
+
+        timing_msg = {"1day": "明日", "same_day": "今日", "2hour": "2時間後", "both": "本日・明日"}.get(timing, "")
+        lines = [f"• {e['date']} {e['time'] or '終日'}　**{e['title']}**" for e in target_events]
+
+        try:
+            await member.send(f"🔔 **リマインダー**\n{timing_msg}の予定をお知らせします！\n\n" + "\n".join(lines))
+        except discord.Forbidden:
+            channel = bot.get_channel(ANNOUNCE_CHANNEL_ID)
+            if channel:
+                await channel.send(f"🔔 {member.mention} {timing_msg}の予定があります！\n" + "\n".join(lines))
+
+# ===== 起動処理 =====
+@bot.event
+async def on_ready():
+    print(f"✅ {bot.user} として起動しました！")
+    reminder_task.start()
+
+@bot.command(name="schedule")
+async def show_schedule(ctx):
+    global panel_message
+    schedule = load_schedule()
+    embed = build_embed(schedule, current_year, current_month)
+    panel_message = await ctx.send(embed=embed, view=ScheduleView(current_year, current_month))
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+bot.run(TOKEN)
